@@ -86,11 +86,18 @@ class RestorationLoss(nn.Module):
         self.lpips_weight = lpips_weight
         self._lpips = None
         self.use_lpips = False
+        self._lpips_failed = False
 
     def enable_lpips(self, device) -> bool:
         """Lazily construct the LPIPS network.  Returns False (and stays off)
         if the package is unavailable, so training never dies over an optional
-        loss term."""
+        loss term.
+
+        The failure is sticky: the caller polls this every step, and retrying a
+        failed import each time would cost more than the loss term is worth.
+        """
+        if self._lpips_failed:
+            return False
         if self._lpips is None:
             try:
                 import lpips  # noqa: PLC0415 -- optional, deliberately lazy
@@ -100,6 +107,7 @@ class RestorationLoss(nn.Module):
                     p.requires_grad_(False)
             except Exception as exc:  # pragma: no cover
                 print(f"[loss] LPIPS unavailable ({exc}); continuing without it")
+                self._lpips_failed = True
                 return False
         self.use_lpips = True
         return True
