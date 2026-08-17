@@ -105,6 +105,11 @@ def main() -> None:
         help="PSNR the overfit gate must clear (needs ~2000 steps to be meaningful)",
     )
     ap.add_argument("--no_lpips", action="store_true")
+    ap.add_argument(
+        "--no_amp", action="store_true",
+        help="train in fp32; slower but removes every fp16 overflow path",
+    )
+    ap.add_argument("--lr", type=float, default=0.0, help="override peak learning rate")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
@@ -117,6 +122,10 @@ def main() -> None:
         cfg["train"]["budget_hours"] = args.hours
     if args.steps:
         cfg["train"]["max_steps"] = args.steps
+    if args.lr:
+        cfg["train"]["lr"] = args.lr
+    if args.no_amp:
+        cfg["train"]["amp"] = False
 
     set_seed(cfg["seed"])
     device = torch.device(
@@ -297,7 +306,32 @@ def main() -> None:
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            # A finite loss can still produce non-finite gradients, and that is
+            # how a corrupting step slipped past the loss-only check: once the
+            # weights are poisoned every subsequent loss is nan, so the earlier
+            # guard only ever saw the aftermath. Skip the step instead.
+            if not torch.isfinite(gnorm):
+                nonfinite_streak += 1
+                total_nonfinite += 1
+                print(
+                    f"[warn ] step {step}: non-finite gradient norm; skipping step "
+                    f"(streak {nonfinite_streak}, total {total_nonfinite})",
+                    flush=True,
+                )
+                opt.zero_grad(set_to_none=True)
+                scaler.update()
+                if nonfinite_streak >= NONFINITE_ABORT:
+                    print(
+                        f"[fatal] {NONFINITE_ABORT} consecutive non-finite updates -- "
+                        "training has diverged. Lower --lr or pass --no_amp.",
+                        flush=True,
+                    )
+                    log_f.close()
+                    raise SystemExit(2)
+                continue
+
             scaler.step(opt)
             scaler.update()
 

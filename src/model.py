@@ -24,7 +24,16 @@ import torch.nn.functional as F
 
 
 class LayerNorm2d(nn.Module):
-    """LayerNorm over the channel dimension of an NCHW tensor."""
+    """LayerNorm over the channel dimension of an NCHW tensor.
+
+    Always computed in fp32, even under autocast.  Variance squares the
+    activations, and fp16 accumulates that reduction in fp16 too -- so a mean of
+    x^2 overflows to ``inf`` once activations merely reach ~100, far below
+    fp16's 65504 ceiling.  The normalisation then yields inf/nan, which
+    propagates into the loss and (via one optimizer step) corrupts the weights
+    permanently.  This is what took down two training runs; the fp32 cast costs
+    almost nothing and removes the failure mode entirely.
+    """
 
     def __init__(self, channels: int, eps: float = 1e-6):
         super().__init__()
@@ -33,10 +42,13 @@ class LayerNorm2d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mu = x.mean(dim=1, keepdim=True)
-        var = x.var(dim=1, keepdim=True, unbiased=False)
-        x = (x - mu) / torch.sqrt(var + self.eps)
-        return x * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x32 = x.float()
+            mu = x32.mean(dim=1, keepdim=True)
+            var = x32.var(dim=1, keepdim=True, unbiased=False)
+            y = (x32 - mu) / torch.sqrt(var + self.eps)
+            y = y * self.weight[None, :, None, None].float() + self.bias[None, :, None, None].float()
+        return y.to(x.dtype)
 
 
 class SimpleGate(nn.Module):
