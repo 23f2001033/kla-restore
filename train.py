@@ -32,7 +32,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from src.data import PairDataset, pack_from_zip, split_indices
+from src.data import PairDataset, pack_dataset, split_indices
 from src.degrade import degrade_batch
 from src.losses import RestorationLoss
 from src.metrics import psnr as psnr_metric
@@ -88,7 +88,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/base.yaml")
     ap.add_argument("--data_dir", default=None, help="override packed data dir")
-    ap.add_argument("--zip_path", default=None, help="override official zip path")
+    ap.add_argument(
+        "--zip_path", default=None,
+        help="override official data source: the .zip archive, or an already-extracted directory",
+    )
     ap.add_argument("--out_dir", default="weights")
     ap.add_argument("--steps", type=int, default=0, help="override step count")
     ap.add_argument("--hours", type=float, default=0.0, help="override time budget")
@@ -133,7 +136,7 @@ def main() -> None:
     data_dir = Path(args.data_dir or cfg["data"]["packed_dir"])
     zip_path = Path(args.zip_path or cfg["data"]["zip_path"])
     if not (data_dir / "meta.json").exists():
-        pack_from_zip(zip_path, data_dir)
+        pack_dataset(zip_path, data_dir)
     meta = json.loads((data_dir / "meta.json").read_text())
     n_total = meta["n"]
     train_idx, val_idx = split_indices(n_total)

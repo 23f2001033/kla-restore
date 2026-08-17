@@ -54,48 +54,9 @@ def split_indices(n_total: int) -> tuple[list[int], list[int]]:
     return train, val
 
 
-def pack_from_zip(zip_path: str | Path, out_dir: str | Path) -> dict:
-    """Unpack the official archive into contiguous memmaps.  Idempotent."""
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    gt_path, lr_path = out_dir / "gt.npy", out_dir / "lr.npy"
-    meta_path = out_dir / "meta.json"
-
-    if meta_path.exists() and gt_path.exists() and lr_path.exists():
-        meta = json.loads(meta_path.read_text())
-        print(f"[data] reusing packed arrays in {out_dir} ({meta['n']} pairs)")
-        return meta
-
-    with zipfile.ZipFile(zip_path) as zf:
-        found: dict[str, set[str]] = {"GT": set(), "NoisyLR": set()}
-        for name in zf.namelist():
-            m = ENTRY_RE.match(name)
-            if m:
-                found[m.group(1)].add(m.group(2))
-
-        ids = sorted(found["GT"] & found["NoisyLR"])
-        if not ids:
-            raise RuntimeError(f"no train/GT + train/NoisyLR pairs found in {zip_path}")
-        missing = (found["GT"] ^ found["NoisyLR"])
-        if missing:
-            print(f"[data] warning: {len(missing)} unpaired ids ignored")
-
-        n = len(ids)
-        gt = np.lib.format.open_memmap(
-            gt_path, mode="w+", dtype=np.float32, shape=(n, GT_SIZE, GT_SIZE)
-        )
-        lr = np.lib.format.open_memmap(
-            lr_path, mode="w+", dtype=np.float32, shape=(n, LR_SIZE, LR_SIZE)
-        )
-        for i, sid in enumerate(ids):
-            gt[i] = np.load(io.BytesIO(zf.read(f"train/GT/{sid}.npy")))
-            lr[i] = np.load(io.BytesIO(zf.read(f"train/NoisyLR/{sid}.npy")))
-            if (i + 1) % 500 == 0:
-                print(f"[data] packed {i+1}/{n}")
-        gt.flush()
-        lr.flush()
-
-    # Integrity checks -- cheap, and they catch a corrupt download immediately.
+def _finish_packing(gt, lr, ids: list[str], out_dir: Path, meta_path: Path) -> dict:
+    """Shared tail end of packing: integrity checks, split, meta.json."""
+    n = len(ids)
     assert gt.shape == (n, GT_SIZE, GT_SIZE) and lr.shape == (n, LR_SIZE, LR_SIZE)
     assert gt.min() >= -1e-6 and gt.max() <= 1.0 + 1e-6, "GT must lie in [0,1]"
     assert lr.max() > 1.0, "LR should exceed 1.0 (speckle) -- packing looks wrong"
@@ -122,6 +83,131 @@ def pack_from_zip(zip_path: str | Path, out_dir: str | Path) -> dict:
         f"LR [{meta['lr_range'][0]:.3f},{meta['lr_range'][1]:.3f}]"
     )
     return meta
+
+
+def _already_packed(out_dir: Path) -> dict | None:
+    gt_path, lr_path, meta_path = out_dir / "gt.npy", out_dir / "lr.npy", out_dir / "meta.json"
+    if meta_path.exists() and gt_path.exists() and lr_path.exists():
+        meta = json.loads(meta_path.read_text())
+        print(f"[data] reusing packed arrays in {out_dir} ({meta['n']} pairs)")
+        return meta
+    return None
+
+
+def pack_from_zip(zip_path: str | Path, out_dir: str | Path) -> dict:
+    """Unpack the official archive into contiguous memmaps.  Idempotent."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = out_dir / "meta.json"
+    cached = _already_packed(out_dir)
+    if cached:
+        return cached
+
+    with zipfile.ZipFile(zip_path) as zf:
+        found: dict[str, set[str]] = {"GT": set(), "NoisyLR": set()}
+        for name in zf.namelist():
+            m = ENTRY_RE.match(name)
+            if m:
+                found[m.group(1)].add(m.group(2))
+
+        ids = sorted(found["GT"] & found["NoisyLR"])
+        if not ids:
+            raise RuntimeError(f"no train/GT + train/NoisyLR pairs found in {zip_path}")
+        missing = found["GT"] ^ found["NoisyLR"]
+        if missing:
+            print(f"[data] warning: {len(missing)} unpaired ids ignored")
+
+        n = len(ids)
+        gt = np.lib.format.open_memmap(
+            out_dir / "gt.npy", mode="w+", dtype=np.float32, shape=(n, GT_SIZE, GT_SIZE)
+        )
+        lr = np.lib.format.open_memmap(
+            out_dir / "lr.npy", mode="w+", dtype=np.float32, shape=(n, LR_SIZE, LR_SIZE)
+        )
+        for i, sid in enumerate(ids):
+            gt[i] = np.load(io.BytesIO(zf.read(f"train/GT/{sid}.npy")))
+            lr[i] = np.load(io.BytesIO(zf.read(f"train/NoisyLR/{sid}.npy")))
+            if (i + 1) % 500 == 0:
+                print(f"[data] packed {i+1}/{n}")
+        gt.flush()
+        lr.flush()
+
+    return _finish_packing(gt, lr, ids, out_dir, meta_path)
+
+
+def _locate_extracted_train_dir(root: Path) -> Path:
+    """Find the ``train/`` directory (containing GT/ and NoisyLR/) under `root`.
+
+    Kaggle unzips an uploaded .zip by default, so the dataset root may itself
+    *be* ``train/``, or may contain it one level down, or the whole thing may
+    sit under an extra wrapper directory from how the zip was created.
+    """
+    candidates = [root, root / "train"]
+    candidates += [p / "train" for p in root.iterdir() if p.is_dir()]
+    candidates += [p for p in root.iterdir() if p.is_dir()]
+    for c in candidates:
+        if (c / "GT").is_dir() and (c / "NoisyLR").is_dir():
+            return c
+    raise RuntimeError(
+        f"could not find a GT/ + NoisyLR/ pair under {root} "
+        f"(looked in: {[str(c) for c in candidates]})"
+    )
+
+
+def pack_from_dir(data_dir: str | Path, out_dir: str | Path) -> dict:
+    """Pack an already-extracted GT/ + NoisyLR/ tree into contiguous memmaps.
+
+    Handles the case where a Kaggle Dataset was created from a .zip and
+    Kaggle auto-extracted it on upload, so there is no .zip file to read --
+    just ``train/GT/*.npy`` and ``train/NoisyLR/*.npy`` directly on disk.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = out_dir / "meta.json"
+    cached = _already_packed(out_dir)
+    if cached:
+        return cached
+
+    train_dir = _locate_extracted_train_dir(Path(data_dir))
+    gt_dir, lr_dir = train_dir / "GT", train_dir / "NoisyLR"
+
+    gt_ids = {p.stem for p in gt_dir.glob("*.npy") if re.fullmatch(r"\d{6}", p.stem)}
+    lr_ids = {p.stem for p in lr_dir.glob("*.npy") if re.fullmatch(r"\d{6}", p.stem)}
+    ids = sorted(gt_ids & lr_ids)
+    if not ids:
+        raise RuntimeError(f"no matching GT/NoisyLR pairs found under {train_dir}")
+    missing = gt_ids ^ lr_ids
+    if missing:
+        print(f"[data] warning: {len(missing)} unpaired ids ignored")
+
+    n = len(ids)
+    gt = np.lib.format.open_memmap(
+        out_dir / "gt.npy", mode="w+", dtype=np.float32, shape=(n, GT_SIZE, GT_SIZE)
+    )
+    lr = np.lib.format.open_memmap(
+        out_dir / "lr.npy", mode="w+", dtype=np.float32, shape=(n, LR_SIZE, LR_SIZE)
+    )
+    for i, sid in enumerate(ids):
+        gt[i] = np.load(gt_dir / f"{sid}.npy")
+        lr[i] = np.load(lr_dir / f"{sid}.npy")
+        if (i + 1) % 500 == 0:
+            print(f"[data] packed {i+1}/{n}")
+    gt.flush()
+    lr.flush()
+
+    return _finish_packing(gt, lr, ids, out_dir, meta_path)
+
+
+def pack_dataset(source: str | Path, out_dir: str | Path) -> dict:
+    """Pack the official data regardless of whether `source` is the .zip
+    archive or an already-extracted directory (Kaggle auto-extracts uploaded
+    zips by default)."""
+    source = Path(source)
+    if source.is_file() and source.suffix.lower() == ".zip":
+        return pack_from_zip(source, out_dir)
+    if source.is_dir():
+        return pack_from_dir(source, out_dir)
+    raise FileNotFoundError(f"{source} is neither a .zip file nor a directory")
 
 
 class PairDataset(Dataset):
