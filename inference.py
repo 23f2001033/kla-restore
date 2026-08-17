@@ -115,6 +115,16 @@ def main() -> None:
         ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
     model = _model_from_ckpt(ckpt)
     model.load_state_dict(ckpt["model"])
+    bad = [n for n, p in model.named_parameters() if not torch.isfinite(p).all()]
+    if bad:
+        # A checkpoint from a diverged training run has NaN/Inf weights, which
+        # would otherwise produce NaN-filled output images with no error --
+        # scoring silently as garbage instead of failing loudly. Fail loudly.
+        raise RuntimeError(
+            f"checkpoint {args.weights} has non-finite parameters ({len(bad)} tensors, "
+            f"e.g. {bad[0]}) -- this weights file is from a diverged/corrupted training "
+            f"run and must not be used for inference."
+        )
     model = model.to(device).eval()
     if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
@@ -160,7 +170,20 @@ def main() -> None:
                     else:
                         out = model(batch)
 
-                out = out.float().clamp_(0, 1).squeeze(1).cpu().numpy()
+                out = out.float()
+                per_sample_finite = torch.isfinite(out).flatten(1).all(1)
+                if not bool(per_sample_finite.all()):
+                    bad_files = [
+                        files[chunk[j]].name
+                        for j in range(len(chunk))
+                        if not per_sample_finite[j]
+                    ]
+                    raise RuntimeError(
+                        f"non-finite restoration output for: {bad_files[:5]}"
+                        f"{'...' if len(bad_files) > 5 else ''} -- refusing to write "
+                        f"garbage restored images."
+                    )
+                out = out.clamp_(0, 1).squeeze(1).cpu().numpy()
                 for j, i in enumerate(chunk):
                     writes.append(
                         pool.submit(

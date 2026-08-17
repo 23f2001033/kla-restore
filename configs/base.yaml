@@ -34,7 +34,10 @@ loss:
 
 train:
   batch_size: 32
-  lr: 1.0e-3                        # 2e-3 diverges on this stack; 5e-4 is the fallback
+  # 1e-3 diverged to NaN loss on the live Kaggle run, right as warmup finished
+  # and LR hit its peak (compounded by a since-fixed AdamW beta2=0.9 bug --
+  # see train.py). 5e-4 is the documented fallback; using it as the default now.
+  lr: 5.0e-4
   weight_decay: 1.0e-4
   warmup_steps: 2000
   grad_clip: 1.0

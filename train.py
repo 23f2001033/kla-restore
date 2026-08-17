@@ -183,7 +183,9 @@ def main() -> None:
         model.parameters(),
         lr=cfg["train"]["lr"],
         weight_decay=cfg["train"]["weight_decay"],
-        betas=(0.9, 0.9),
+        betas=(0.9, 0.999),  # standard; (0.9, 0.9) made the 2nd-moment estimate
+        # too noisy and let a single gradient spike at peak LR blow up the
+        # weights irrecoverably -- see the run_log postmortem note below.
     )
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     criterion = RestorationLoss(
@@ -220,6 +222,9 @@ def main() -> None:
     t_start = time.time()
     t_calib = None
     loss_ema = None
+    nonfinite_streak = 0
+    total_nonfinite = 0
+    NONFINITE_ABORT = 20  # consecutive non-finite losses => training has diverged
     model.train()
 
     print(f"[train] starting run {run_id} (git {git_hash()})")
@@ -263,13 +268,39 @@ def main() -> None:
                 pred = model(lr_img)
                 loss, parts = criterion(pred, gt)
 
+            lv = float(loss.detach())
+            if not math.isfinite(lv):
+                # A non-finite loss must never reach backward(): GradScaler only
+                # guards against inf/nan *gradients*, not a loss that is already
+                # nan going in, so a bad batch here would otherwise corrupt the
+                # weights permanently on the very next optimizer step -- and
+                # every step after that, since nan propagates forever once it's
+                # in the parameters. Skip this batch entirely instead.
+                nonfinite_streak += 1
+                total_nonfinite += 1
+                print(
+                    f"[warn ] step {step}: non-finite loss ({lv}); skipping batch "
+                    f"(streak {nonfinite_streak}, total {total_nonfinite})",
+                    flush=True,
+                )
+                if nonfinite_streak >= NONFINITE_ABORT:
+                    print(
+                        f"[fatal] {NONFINITE_ABORT} consecutive non-finite losses -- "
+                        "training has diverged. Aborting rather than burning the "
+                        "rest of the budget. Lower --lr and restart from weights/best.pt.",
+                        flush=True,
+                    )
+                    log_f.close()
+                    raise SystemExit(2)
+                continue
+            nonfinite_streak = 0
+
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(opt)
             scaler.update()
 
-            lv = float(loss.detach())
             loss_ema = lv if loss_ema is None else 0.99 * loss_ema + 0.01 * lv
             step += 1
 
