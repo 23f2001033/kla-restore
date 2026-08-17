@@ -45,5 +45,10 @@ train:
   max_steps: 0                      # 0 = derive from budget_hours; >0 overrides
   val_every: 5000
   num_workers: 4
-  amp: true
+  # fp32 by default. Mixed precision repeatedly produced non-finite gradients
+  # on this stack even after forcing the normalisation layers to fp32, and a
+  # training run that completes is worth far more than one that is 2x faster
+  # and dies. The model is only 0.68M parameters, so fp32 fits the budget
+  # comfortably. Re-enable with --amp once there is time to chase it properly.
+  amp: false
   channels_last: true

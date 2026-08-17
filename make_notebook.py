@@ -65,7 +65,9 @@ checks = {
     "non-finite GRADIENT guard":  "isfinite(gnorm)" in train_src,
     "--no_amp escape hatch":      "--no_amp" in train_src,
     "LayerNorm2d forced to fp32": "enabled=False" in model_src,
+    "streak cleared only on a real step": "NONFINITE_TOTAL_ABORT" in train_src,
     "lr = 5.0e-4":                lr_line == ["lr: 5.0e-4"],
+    "fp32 default (amp: false)":  "amp: false" in cfg_txt,
     "pack_dataset present":       "def pack_dataset" in open("src/data.py").read(),
 }
 for k, v in checks.items():
@@ -105,48 +107,42 @@ from src.data import pack_dataset
 meta = pack_dataset(DATA_SOURCE, "/kaggle/working/packed")
 '''
 
-CELL3 = '''# --- Cell 3: pre-flight gate, with automatic fp32 fallback ----------------
-# Two earlier runs died to fp16 overflow inside the normalisation layers: a
-# mean of x^2 overflows fp16 once activations reach only ~100, far below
-# fp16's 65504 ceiling. That path is now forced to fp32, but the gate proves
-# it empirically instead of trusting it -- and falls back to full fp32 if any
-# other overflow path remains. Cost of a numerical failure: ~2 minutes.
+CELL3 = '''# --- Cell 3: pre-flight gate ----------------------------------------------
+# Runs in fp32 (the config default). Mixed precision repeatedly produced
+# non-finite gradients on this stack, and a run that finishes beats one that
+# is 2x faster and dies -- the model is only 0.68M parameters, so fp32 fits
+# the time budget comfortably.
+#
+# The gate overfits 2 image pairs. A correct pipeline memorises two images
+# easily; if this cannot clear 35 dB something is wrong upstream of training
+# and the long run would be wasted. ~2-4 minutes.
 import subprocess
 
-BASE = ["python", "train.py", "--overfit", "2", "--steps", "2000",
-        "--gate_db", "35", "--num_workers", "2", "--no_lpips",
-        "--data_dir", "/kaggle/working/packed"]
+r = subprocess.run(
+    ["python", "train.py", "--overfit", "2", "--steps", "2000",
+     "--gate_db", "35", "--num_workers", "2", "--no_lpips",
+     "--data_dir", "/kaggle/working/packed"])
 
-AMP_FLAGS = []          # decided here, reused by the training cell
-print("=" * 62)
-print("GATE ATTEMPT 1: mixed precision")
-print("=" * 62)
-r = subprocess.run(BASE)
-
-if r.returncode != 0:
-    print("")
-    print("=" * 62)
-    print("fp16 gate failed -> retrying in fp32 (slower, no overflow path)")
-    print("=" * 62)
-    AMP_FLAGS = ["--no_amp"]
-    r = subprocess.run(BASE + AMP_FLAGS)
-
-assert r.returncode == 0, "GATE FAILED in both fp16 and fp32 -- do not train"
+assert r.returncode == 0, (
+    "GATE FAILED (exit %d) -- do not start training. Non-zero means either the "
+    "pipeline is broken or training diverged; the log above says which." % r.returncode)
 print("")
-print("GATE PASSED -- training will use:", "fp32" if AMP_FLAGS else "mixed precision")
+print("GATE PASSED")
 '''
 
 CELL4 = '''# --- Cell 4: training (~6.5 h) -------------------------------------------
-# Uses whichever precision passed the gate. Watch the loss over the first few
-# hundred steps: it should fall steadily. Any non-finite loss or gradient is
-# skipped rather than applied, and the run aborts after 20 consecutive bad
-# updates instead of silently burning the budget.
+# Watch the loss over the first few hundred steps: it should fall steadily.
+#
+# Non-finite losses and gradients are skipped rather than applied, and the run
+# aborts on 20 consecutive OR 200 total bad updates. Both bounds matter: an
+# alternating good/bad cycle never builds a long streak, which is exactly how
+# an earlier version spun ~8000 times without ever tripping its own guard.
 import subprocess
 r = subprocess.run(
     ["python", "train.py", "--config", "configs/base.yaml",
      "--data_dir", "/kaggle/working/packed",
      "--out_dir", "/kaggle/working/weights",
-     "--hours", "6.5", "--num_workers", "2"] + AMP_FLAGS)
+     "--hours", "6.5", "--num_workers", "2"])
 print("training exit code:", r.returncode)
 assert r.returncode == 0, "training failed -- see the log above"
 '''

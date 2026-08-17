@@ -107,7 +107,11 @@ def main() -> None:
     ap.add_argument("--no_lpips", action="store_true")
     ap.add_argument(
         "--no_amp", action="store_true",
-        help="train in fp32; slower but removes every fp16 overflow path",
+        help="force fp32 (already the config default)",
+    )
+    ap.add_argument(
+        "--amp", action="store_true",
+        help="opt into mixed precision; faster, but see the note in configs/base.yaml",
     )
     ap.add_argument("--lr", type=float, default=0.0, help="override peak learning rate")
     ap.add_argument("--device", default=None)
@@ -124,7 +128,9 @@ def main() -> None:
         cfg["train"]["max_steps"] = args.steps
     if args.lr:
         cfg["train"]["lr"] = args.lr
-    if args.no_amp:
+    if args.amp:
+        cfg["train"]["amp"] = True
+    if args.no_amp:            # explicit --no_amp always wins
         cfg["train"]["amp"] = False
 
     set_seed(cfg["seed"])
@@ -233,7 +239,9 @@ def main() -> None:
     loss_ema = None
     nonfinite_streak = 0
     total_nonfinite = 0
-    NONFINITE_ABORT = 20  # consecutive non-finite losses => training has diverged
+    NONFINITE_ABORT = 20        # consecutive non-finite updates => diverged
+    NONFINITE_TOTAL_ABORT = 200 # absolute cap: catches an alternating good/bad
+                                # cycle that never builds a long streak
     model.train()
 
     print(f"[train] starting run {run_id} (git {git_hash()})")
@@ -292,17 +300,18 @@ def main() -> None:
                     f"(streak {nonfinite_streak}, total {total_nonfinite})",
                     flush=True,
                 )
-                if nonfinite_streak >= NONFINITE_ABORT:
+                if (nonfinite_streak >= NONFINITE_ABORT
+                        or total_nonfinite >= NONFINITE_TOTAL_ABORT):
                     print(
-                        f"[fatal] {NONFINITE_ABORT} consecutive non-finite losses -- "
-                        "training has diverged. Aborting rather than burning the "
-                        "rest of the budget. Lower --lr and restart from weights/best.pt.",
+                        f"[fatal] non-finite loss ({nonfinite_streak} consecutive, "
+                        f"{total_nonfinite} total) -- training has diverged. "
+                        "Aborting rather than burning the rest of the budget. "
+                        "Lower --lr, or pass --no_amp.",
                         flush=True,
                     )
                     log_f.close()
                     raise SystemExit(2)
                 continue
-            nonfinite_streak = 0
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -322,10 +331,12 @@ def main() -> None:
                 )
                 opt.zero_grad(set_to_none=True)
                 scaler.update()
-                if nonfinite_streak >= NONFINITE_ABORT:
+                if (nonfinite_streak >= NONFINITE_ABORT
+                        or total_nonfinite >= NONFINITE_TOTAL_ABORT):
                     print(
-                        f"[fatal] {NONFINITE_ABORT} consecutive non-finite updates -- "
-                        "training has diverged. Lower --lr or pass --no_amp.",
+                        f"[fatal] non-finite gradients ({nonfinite_streak} consecutive, "
+                        f"{total_nonfinite} total) -- training has diverged. "
+                        "Lower --lr, or pass --no_amp.",
                         flush=True,
                     )
                     log_f.close()
@@ -335,6 +346,12 @@ def main() -> None:
             scaler.step(opt)
             scaler.update()
 
+            # Only a step that actually applied clears the streak. Resetting
+            # anywhere earlier lets a loss-ok/grad-bad cycle alternate forever:
+            # the streak returns to 0 every iteration, the abort never fires,
+            # and because the skipped step leaves the weights unchanged the
+            # exact same failure repeats indefinitely.
+            nonfinite_streak = 0
             loss_ema = lv if loss_ema is None else 0.99 * loss_ema + 0.01 * lv
             step += 1
 
