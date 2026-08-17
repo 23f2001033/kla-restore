@@ -1,13 +1,17 @@
-# Core runtime dependencies for inference.py (kept deliberately minimal --
-# every import counts against the scored end-to-end runtime).
-torch>=2.1
-numpy>=1.24
+# === Required to run the submission entry point (run.py) ==================
+# run.py imports nothing beyond these two. No internet access, API keys or
+# additional model downloads are needed at inference time.
+#
+# Install the CUDA build of torch for NVIDIA GPU execution, e.g.:
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+# Any torch >= 2.1 works; the checkpoint carries no version-specific state.
+torch==2.5.1
+numpy==2.1.3
 
-# Training / evaluation only.
-PyYAML>=6.0
-matplotlib>=3.7        # qualitative figures in evaluate.py
-Pillow>=10.0           # PNG/TIFF I/O path
-lpips>=0.1.4           # optional: perceptual loss + LPIPS metric
-
-# A full `pip freeze` of the exact training environment (with pinned versions
-# and the CUDA build of torch) is in requirements-freeze.txt.
+# === Additional, only for reproducing training / evaluation ===============
+# Not imported by run.py.
+PyYAML==6.0.3          # config parsing in train.py
+Pillow==12.3.0         # image I/O in the optional PNG/TIFF path
+matplotlib==3.11.0     # qualitative figures in evaluate.py
+lpips==0.1.4           # perceptual loss for the final fine-tune, and reporting
+scikit-image==0.25.2   # metric cross-checks

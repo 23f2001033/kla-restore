@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent
 FILES = [
     "src/__init__.py", "src/data.py", "src/degrade.py", "src/model.py",
     "src/losses.py", "src/metrics.py", "train.py", "evaluate.py",
-    "inference.py", "configs/base.yaml", "make_presentation.py",
+    "inference.py", "run.py", "configs/base.yaml", "make_presentation.py",
     "analyze_degradation.py",
 ]
 
@@ -113,14 +113,19 @@ CELL3 = '''# --- Cell 3: pre-flight gate ---------------------------------------
 # is 2x faster and dies -- the model is only 0.68M parameters, so fp32 fits
 # the time budget comfortably.
 #
-# The gate overfits 2 image pairs. A correct pipeline memorises two images
-# easily; if this cannot clear 35 dB something is wrong upstream of training
-# and the long run would be wasted. ~2-4 minutes.
+# The gate overfits 2 image pairs to prove the data path, loss and optimiser
+# all work before committing hours of GPU time.
+#
+# Threshold is 28 dB, set from measurement rather than guessed: a 2000-step
+# run reaches ~28.8 dB, while bicubic (i.e. doing nothing) scores 23.18 dB. A
+# broken pipeline lands at or below bicubic, so 28 dB separates the two
+# cleanly. An earlier 35 dB threshold was unreachable in 2000 steps and
+# blocked a perfectly healthy run. ~2-4 minutes.
 import subprocess
 
 r = subprocess.run(
     ["python", "train.py", "--overfit", "2", "--steps", "2000",
-     "--gate_db", "35", "--num_workers", "2", "--no_lpips",
+     "--gate_db", "28", "--num_workers", "2", "--no_lpips",
      "--data_dir", "/kaggle/working/packed"])
 
 assert r.returncode == 0, (
@@ -141,7 +146,7 @@ import subprocess
 r = subprocess.run(
     ["python", "train.py", "--config", "configs/base.yaml",
      "--data_dir", "/kaggle/working/packed",
-     "--out_dir", "/kaggle/working/weights",
+     "--out_dir", "models",
      "--hours", "6.5", "--num_workers", "2"])
 print("training exit code:", r.returncode)
 assert r.returncode == 0, "training failed -- see the log above"
@@ -149,10 +154,10 @@ assert r.returncode == 0, "training failed -- see the log above"
 
 CELL5 = '''# --- Cell 5: evaluate -----------------------------------------------------
 import os, subprocess
-assert os.path.exists("/kaggle/working/weights/best.pt"), \\
-    "no best.pt -- training did not reach its first validation (step 5000)"
+assert os.path.exists("models/best.pt"), \\
+    "no models/best.pt -- training did not reach its first validation (step 5000)"
 subprocess.run(["python", "evaluate.py",
-                "--weights", "/kaggle/working/weights/best.pt",
+                "--weights", "models/best.pt",
                 "--data_dir", "/kaggle/working/packed",
                 "--out_dir", "/kaggle/working/results"], check=True)
 '''
@@ -173,10 +178,9 @@ print(len(val_idx), "files staged")
 CELL7 = '''# Timed the way KLA times it: process start through last file written.
 import time, subprocess
 t0 = time.perf_counter()
-subprocess.run(["python", "inference.py",
-                "--input_dir", "/kaggle/working/bench_in",
-                "--output_dir", "/kaggle/working/bench_out",
-                "--weights", "/kaggle/working/weights/best.pt"], check=True)
+subprocess.run(["python", "run.py",
+                "/kaggle/working/bench_in",
+                "/kaggle/working/bench_out"], check=True)
 print("wall clock, full pipeline: %.2f s" % (time.perf_counter() - t0))
 '''
 
@@ -186,7 +190,7 @@ shutil.copytree("/kaggle/working/results", "results", dirs_exist_ok=True)
 subprocess.run(["python", "make_presentation.py"], check=True)
 shutil.copy("solution_presentation.pptx", "/kaggle/working/")
 
-print("weights:", glob.glob("/kaggle/working/weights/*"))
+print("models:", glob.glob("models/*"))
 print("results:", glob.glob("/kaggle/working/results/*"))
 subprocess.run(
     "cd /kaggle/working && zip -r submission_artifacts.zip weights results "

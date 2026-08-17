@@ -12,11 +12,17 @@ clean image at ground-truth resolution.
 pip install -r requirements.txt
 ```
 
-**Inference** (the entry point used for benchmarking — no source edits needed):
+**Inference — the official submission entry point:**
 
 ```bash
-python inference.py --input_dir /path/to/degraded --output_dir /path/to/restored
+python run.py <input-dir> <output-dir>
 ```
+
+`run.py` is self-contained: the model definition is inline and it imports only
+`torch` and `numpy`, so it needs no internet access, no API keys, no additional
+downloads, no user interaction and no manual configuration. Weights are loaded
+automatically from `models/`. The output directory is created if it does not
+exist.
 
 **Training** (reproduces the submitted checkpoint):
 
@@ -27,24 +33,38 @@ python train.py --config configs/base.yaml
 **Evaluation** on the frozen validation split:
 
 ```bash
-python evaluate.py --weights weights/best.pt
+python evaluate.py --weights models/best.pt
 ```
 
----
+### Submission layout
 
-## Input / output contract
+```
+run.py              official entry point:  python run.py <input-dir> <output-dir>
+requirements.txt    pinned dependencies
+README.md           this file
+models/best.pt      trained weights (loaded automatically)
+```
+
+Everything else in the repository — `train.py`, `evaluate.py`,
+`analyze_degradation.py`, `configs/`, `src/`, `notebooks/`, `results/` — supports
+reproducing the checkpoint and is not needed to run inference.
+
+### Input / output contract
 
 | | |
 |---|---|
-| Input | Directory of `.npy` (float32) and/or `.png`/`.tif` images, any mix of resolutions |
-| Output | One file per input, **same basename, same extension**, in `--output_dir` |
-| Scale | Always 2x: 128x128 -> 256x256, 256x256 -> 512x512 |
-| Input range | **Never clipped.** NoisyLR legitimately falls outside [0,1] (observed [-0.28, 2.16]) |
-| Output range | **Always clamped to [0,1]**, since KLA scores images exactly as saved |
-| Channels | Grayscale. An RGB-encoded grayscale PNG is collapsed to one channel |
+| Input | Directory of `.npy` files. `(H,W)`, `(H,W,1)` and `(1,H,W)` are all accepted |
+| Output | One `.npy` per input, **same filename**, in `<output-dir>` |
+| Output shape | Grayscale `(H, W)` at **2× the input resolution** — 128→256, 256→512 |
+| Output dtype | `float32` |
+| Output range | Clamped to `[0, 1]`, guaranteed free of NaN and Inf |
+| Input handling | Inputs are **never** clipped — NoisyLR legitimately falls outside [0,1] |
+| Device | NVIDIA GPU when available, automatic CPU fallback |
 
 The model is fully convolutional with no fixed-size assumption, so the same
-weights handle both released resolution pairs.
+weights handle both released resolution pairs. Observed NoisyLR range across the
+training set is [-0.28, 2.16] — inputs are passed through unclipped, and only the
+*output* is clamped, since KLA scores images exactly as saved.
 
 ---
 
@@ -123,7 +143,7 @@ output (B,1,2H,2W)
 - **No BatchNorm anywhere** — all normalisation is channel-wise LayerNorm, so
   results are batch-size independent. Verified: `max|batch8 - batch1| = 4.8e-07`.
 - Per-block residual scales initialise at zero, so a 16-block stack starts as an
-  identity map and trains stably at lr=1e-3 from scratch.
+  identity map and trains stably from scratch.
 - The global bilinear skip carries some input noise through, which the final
   conv must cancel. It is a deliberate trade: it lets the network learn a
   residual rather than the whole image, converging far faster — which matters
@@ -157,10 +177,31 @@ L = Charbonnier + 0.15 * (1 - SSIM)      [+ 0.05 * LPIPS for the final 10% of st
 |---|---|
 | Data | 2880 train / 320 validation pairs, split frozen in `configs/base.yaml` |
 | Crops | 64x64 LR -> 128x128 GT, random flips and 90-degree rotations |
-| Optimiser | AdamW, betas (0.9, 0.9), weight decay 1e-4 |
-| LR schedule | 1e-3, 2000-step warmup, cosine to 1e-6 |
-| Batch size | 32, AMP, channels_last, grad-norm clip 1.0 |
+| Optimiser | AdamW, betas (0.9, 0.999), weight decay 1e-4 |
+| LR schedule | 5e-4, 2000-step warmup, cosine to 1e-6 |
+| Batch size | 32, fp32, channels_last, grad-norm clip 1.0 |
+| Stability | non-finite loss *and* gradient guards; aborts on 20 consecutive or 200 total bad updates |
 | Checkpointing | Validate and checkpoint every 5000 steps, keep best by PSNR |
+
+**Numerical stability — why training runs in fp32.** Mixed precision produced
+non-finite gradients on this stack. One mechanism was identified and fixed
+directly: `LayerNorm2d` computes a variance, which squares its activations, and
+under autocast fp16 accumulates that reduction in fp16 too — so `mean(x^2)`
+overflows to `inf` once activations reach only ~100, far below fp16's 65504
+ceiling. Measured: at activation scale 100 the fp32 mean is 1.0e4 while fp16 is
+already `inf`. That layer is now forced to fp32 (`src/model.py`), which costs
+almost nothing.
+
+Non-finite gradients persisted from some other path, so training defaults to
+fp32 (`amp: false`). At 0.68 M parameters this fits the time budget comfortably,
+and a run that completes is worth more than one that is 2x faster and diverges.
+`--amp` re-enables mixed precision. Note that CPU testing cannot surface this
+class of bug at all, since CPU runs fp32.
+
+Both the loss and the gradient norm are checked each step; a bad batch is
+skipped rather than applied, and training aborts on 20 consecutive **or** 200
+total bad updates. Both bounds are needed — an alternating good/bad cycle never
+builds a long streak.
 
 **Validation split.** KLA's slides show sample 000000 -> source `0001.png` and
 sample 000500 -> source `0186.png`, i.e. samples are ordered by source image
@@ -194,7 +235,7 @@ the long run would be wasted. It exits non-zero on failure so it can gate a scri
 - Each validation appends a row to `results/run_log.csv` with the run id, git
   hash, seed, step, LR, loss, all three metrics, parameter count, and the full
   config as JSON.
-- The checkpoint embeds its own model config, so `inference.py` rebuilds the
+- The checkpoint embeds its own model config, so `run.py` rebuilds the
   architecture without reading any config file.
 
 ---
@@ -228,7 +269,7 @@ Metric conventions, stated because implementations differ:
 ## Inference performance
 
 End-to-end runtime is a scored axis and covers script startup, model init, disk
-reads, inference and disk writes. `inference.py` accordingly:
+reads, inference and disk writes. `run.py` accordingly:
 
 - imports only `torch`, `numpy` and `argparse` at module level — no yaml, lpips,
   skimage or matplotlib, each of which would add import time for no benefit;
@@ -256,7 +297,7 @@ src/
   model.py         network
   losses.py        Charbonnier + SSIM (+ LPIPS)
   metrics.py       PSNR / SSIM / LPIPS
-weights/best.pt    submitted checkpoint
+models/best.pt     submitted checkpoint
 results/           metrics.csv, run_log.csv, figures
 notebooks/         Kaggle training notebook
 ```
@@ -273,7 +314,7 @@ derived from that same data.
 fine-tune and for reporting. Its VGG16 backbone carries ImageNet-pretrained
 weights distributed with the package. It is an optional dependency: training
 degrades gracefully to Charbonnier + SSIM if it is unavailable, and
-`inference.py` never imports it.
+`run.py` never imports it.
 
 ---
 

@@ -4,7 +4,8 @@ data/
 *.zip
 
 # Keep weights/best.pt (it is a required deliverable) but not intermediates.
-weights/last.pt
+models/last.pt
+weights/
 weights/*.ckpt
 
 # Evaluation scratch
@@ -17,3 +18,7 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# Trained weights are added at submission time, not committed from a test run.
+models/*.pt
+models/*.pth
