@@ -1,0 +1,13 @@
+# Core runtime dependencies for inference.py (kept deliberately minimal --
+# every import counts against the scored end-to-end runtime).
+torch>=2.1
+numpy>=1.24
+
+# Training / evaluation only.
+PyYAML>=6.0
+matplotlib>=3.7        # qualitative figures in evaluate.py
+Pillow>=10.0           # PNG/TIFF I/O path
+lpips>=0.1.4           # optional: perceptual loss + LPIPS metric
+
+# A full `pip freeze` of the exact training environment (with pinned versions
+# and the CUDA build of torch) is in requirements-freeze.txt.

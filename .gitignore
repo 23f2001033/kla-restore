@@ -1,0 +1,19 @@
+# Packed dataset and the official archive -- large, and redistributing the
+# sponsor's data is not ours to do.
+data/
+*.zip
+
+# Keep weights/best.pt (it is a required deliverable) but not intermediates.
+weights/last.pt
+weights/*.ckpt
+
+# Evaluation scratch
+results/bench_out/
+results/*.npy
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.DS_Store
