@@ -138,6 +138,15 @@ print("GATE PASSED")
 CELL4 = '''# --- Cell 4: training (~6.5 h) -------------------------------------------
 # Watch the loss over the first few hundred steps: it should fall steadily.
 #
+# Checkpoints every 1500 steps (not 5000): a Kaggle session that restarts
+# clears /kaggle/working, and the first full run lost 6.4 hours of training
+# that way. Download models/best.pt as soon as it appears -- do not leave the
+# only copy in a session.
+#
+# num_workers=4 with prefetching: the first run managed 0.8 it/s on a T4 for a
+# 0.68M model, which means the GPU was starving on the input pipeline rather
+# than computing.
+#
 # Non-finite losses and gradients are skipped rather than applied, and the run
 # aborts on 20 consecutive OR 200 total bad updates. Both bounds matter: an
 # alternating good/bad cycle never builds a long streak, which is exactly how
@@ -147,9 +156,22 @@ r = subprocess.run(
     ["python", "train.py", "--config", "configs/base.yaml",
      "--data_dir", "/kaggle/working/packed",
      "--out_dir", "models",
-     "--hours", "6.5", "--num_workers", "2"])
+     "--hours", "4.5", "--num_workers", "4",
+     "--val_every", "1500"])
 print("training exit code:", r.returncode)
 assert r.returncode == 0, "training failed -- see the log above"
+'''
+
+CELL4B = '''# --- Cell 4b: SAVE THE CHECKPOINT NOW -------------------------------------
+# Run this the moment models/best.pt first appears, and download the file from
+# the Output panel. /kaggle/working is wiped when a session restarts, and
+# "Save Version" is the only thing that persists it.
+import os, shutil
+src = "models/best.pt"
+assert os.path.exists(src), "no checkpoint yet -- wait for the first validation"
+shutil.copy(src, "/kaggle/working/best.pt")
+print("%.1f MB -> /kaggle/working/best.pt  (download it from the Output panel)"
+      % (os.path.getsize(src) / 1e6))
 '''
 
 CELL5 = '''# --- Cell 5: evaluate -----------------------------------------------------
@@ -215,7 +237,7 @@ numerical failure costs about two minutes rather than a wasted night."""
 
 def main() -> None:
     cells = [md(HEADER), code(payload() + [CELL1])]
-    cells += [code(c) for c in (CELL2, CELL3, CELL4, CELL5, CELL6, CELL7, CELL8)]
+    cells += [code(c) for c in (CELL2, CELL3, CELL4, CELL4B, CELL5, CELL6, CELL7, CELL8)]
     nb = {
         "cells": cells,
         "metadata": {

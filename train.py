@@ -114,6 +114,14 @@ def main() -> None:
         help="opt into mixed precision; faster, but see the note in configs/base.yaml",
     )
     ap.add_argument("--lr", type=float, default=0.0, help="override peak learning rate")
+    ap.add_argument(
+        "--val_every", type=int, default=0,
+        help="validate/checkpoint interval; smaller means less lost to a session kill",
+    )
+    ap.add_argument(
+        "--synth_prob", type=float, default=-1.0,
+        help="fraction of each batch replaced by synthetic pairs (0 disables)",
+    )
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
@@ -132,6 +140,10 @@ def main() -> None:
         cfg["train"]["amp"] = True
     if args.no_amp:            # explicit --no_amp always wins
         cfg["train"]["amp"] = False
+    if args.val_every:
+        cfg["train"]["val_every"] = args.val_every
+    if args.synth_prob >= 0:
+        cfg["degradation"]["synth_prob"] = args.synth_prob
 
     set_seed(cfg["seed"])
     device = torch.device(
@@ -174,6 +186,13 @@ def main() -> None:
     val_ds = PairDataset(data_dir, val_idx, augment=False, full_image=True)
 
     nw = int(cfg["train"]["num_workers"])
+    loader_kw = {}
+    if nw > 0:
+        # Without prefetching, the GPU waits on the loader between steps. This
+        # was the dominant cost in the first full run (0.8 it/s on a T4 for a
+        # 0.68M model -- the GPU was starving, not saturated).
+        loader_kw["persistent_workers"] = True
+        loader_kw["prefetch_factor"] = 4
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg["train"]["batch_size"],
@@ -181,7 +200,7 @@ def main() -> None:
         num_workers=nw,
         pin_memory=device.type == "cuda",
         drop_last=not args.overfit,
-        persistent_workers=nw > 0,
+        **loader_kw,
     )
     val_loader = DataLoader(
         val_ds, batch_size=16, shuffle=False, num_workers=0, pin_memory=device.type == "cuda"

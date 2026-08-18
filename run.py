@@ -50,14 +50,19 @@ class LayerNorm2d(nn.Module):
         self.bias = nn.Parameter(torch.zeros(channels))
         self.eps = eps
 
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        mu = x.mean(dim=1, keepdim=True)
+        var = x.var(dim=1, keepdim=True, unbiased=False)
+        y = (x - mu) / torch.sqrt(var + self.eps)
+        return y * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # The fp32 cast is only needed under autocast; entering the context
+        # unconditionally costs real time, and this runs 32x per forward.
+        if not torch.is_autocast_enabled(x.device.type):
+            return self._normalize(x)
         with torch.autocast(device_type=x.device.type, enabled=False):
-            x32 = x.float()
-            mu = x32.mean(dim=1, keepdim=True)
-            var = x32.var(dim=1, keepdim=True, unbiased=False)
-            y = (x32 - mu) / torch.sqrt(var + self.eps)
-            y = (y * self.weight[None, :, None, None].float()
-                 + self.bias[None, :, None, None].float())
+            y = self._normalize(x.float())
         return y.to(x.dtype)
 
 
