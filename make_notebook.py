@@ -101,7 +101,7 @@ DATA_SOURCE = DATA_ROOT / "train.zip" if (DATA_ROOT / "train.zip").is_file() els
 print("data source:", DATA_SOURCE)
 
 import subprocess
-subprocess.run(["pip", "-q", "install", "lpips"], check=False)
+subprocess.run(["pip", "-q", "install", "lpips", "python-pptx"], check=False)
 
 from src.data import pack_dataset
 meta = pack_dataset(DATA_SOURCE, "/kaggle/working/packed")
@@ -135,7 +135,7 @@ print("")
 print("GATE PASSED")
 '''
 
-CELL4 = '''# --- Cell 4: training (~6.5 h) -------------------------------------------
+CELL4 = '''# --- Cell 4: training (~4.5 h) -------------------------------------------
 # Watch the loss over the first few hundred steps: it should fall steadily.
 #
 # Checkpoints every 1500 steps (not 5000): a Kaggle session that restarts
@@ -175,13 +175,22 @@ print("%.1f MB -> /kaggle/working/best.pt  (download it from the Output panel)"
 '''
 
 CELL5 = '''# --- Cell 5: evaluate -----------------------------------------------------
+# Retries without LPIPS if the perceptual metric fails for any reason: PSNR and
+# SSIM are the numbers that matter, and losing them to an optional third metric
+# would be the wrong trade.
 import os, subprocess
 assert os.path.exists("models/best.pt"), \\
-    "no models/best.pt -- training did not reach its first validation (step 5000)"
-subprocess.run(["python", "evaluate.py",
-                "--weights", "models/best.pt",
-                "--data_dir", "/kaggle/working/packed",
-                "--out_dir", "/kaggle/working/results"], check=True)
+    "no models/best.pt -- training has not reached its first validation yet"
+
+BASE = ["python", "evaluate.py", "--weights", "models/best.pt",
+        "--data_dir", "/kaggle/working/packed",
+        "--out_dir", "/kaggle/working/results"]
+if subprocess.run(BASE).returncode != 0:
+    print("")
+    print("evaluation failed -- retrying without LPIPS")
+    subprocess.run(BASE + ["--no_lpips"], check=True)
+print("")
+print("metrics -> /kaggle/working/results/metrics.csv")
 '''
 
 CELL6 = '''# --- Cell 6: stage the validation split for end-to-end timing -------------
@@ -200,17 +209,27 @@ print(len(val_idx), "files staged")
 CELL7 = '''# Timed the way KLA times it: process start through last file written.
 import time, subprocess
 t0 = time.perf_counter()
-subprocess.run(["python", "run.py",
-                "/kaggle/working/bench_in",
-                "/kaggle/working/bench_out"], check=True)
-print("wall clock, full pipeline: %.2f s" % (time.perf_counter() - t0))
+rc = subprocess.run(["python", "run.py",
+                     "/kaggle/working/bench_in",
+                     "/kaggle/working/bench_out"]).returncode
+dt = time.perf_counter() - t0
+if rc == 0:
+    print("wall clock, full pipeline: %.2f s" % dt)
+else:
+    # Loud, but not fatal: cell 8 still needs to bundle the artifacts.
+    print("!!! run.py FAILED (exit %d) -- the graded entry point is broken, fix "
+          "before submitting" % rc)
 '''
 
 CELL8 = '''# --- Cell 8: regenerate the deck with real numbers, bundle artifacts ------
 import glob, shutil, subprocess
 shutil.copytree("/kaggle/working/results", "results", dirs_exist_ok=True)
-subprocess.run(["python", "make_presentation.py"], check=True)
-shutil.copy("solution_presentation.pptx", "/kaggle/working/")
+if subprocess.run(["python", "make_presentation.py"]).returncode == 0:
+    shutil.copy("solution_presentation.pptx", "/kaggle/working/")
+    print("deck regenerated with the measured numbers")
+else:
+    print("deck generation failed (python-pptx missing?) -- run "
+          "make_presentation.py locally instead; the metrics CSV is what it reads")
 
 print("models:", glob.glob("models/*"))
 print("results:", glob.glob("/kaggle/working/results/*"))
