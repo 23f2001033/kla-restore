@@ -61,10 +61,15 @@ def summarize(name, pred, gt, lpips_fn=None) -> dict:
         "lpips": float("nan"),
     }
     if lpips_fn is not None:
-        vals = [
-            float(lpips_fn(pred[i : i + 1], gt[i : i + 1])) for i in range(pred.shape[0])
-        ]
-        row["lpips"] = float(np.mean(vals))
+        try:
+            # Batched: one call per 16 images rather than per image.
+            vals = []
+            for s in range(0, pred.shape[0], 16):
+                vals.append(float(lpips_fn(pred[s : s + 16], gt[s : s + 16])))
+            row["lpips"] = float(np.mean(vals))
+        except Exception as exc:
+            # Never let an optional perceptual metric cost us PSNR and SSIM.
+            print(f"[eval] LPIPS failed ({exc}); reporting PSNR/SSIM only")
     return row, per_psnr, per_ssim
 
 

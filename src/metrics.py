@@ -40,12 +40,16 @@ class LPIPSMetric:
     def __init__(self, device, net: str = "vgg"):
         import lpips  # noqa: PLC0415
 
-        self.model = lpips.LPIPS(net=net).to(device).eval()
+        self.device = torch.device(device)
+        self.model = lpips.LPIPS(net=net).to(self.device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
 
     @torch.no_grad()
     def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        p3 = pred.float().clamp(0, 1).repeat(1, 3, 1, 1) * 2 - 1
-        t3 = target.float().repeat(1, 3, 1, 1) * 2 - 1
-        return self.model(p3, t3).mean()
+        # Callers often hand us CPU tensors (evaluate.py moves predictions back
+        # to host memory before scoring), while the LPIPS network lives on the
+        # GPU. Move the inputs rather than assuming they already match.
+        p3 = pred.to(self.device).float().clamp(0, 1).repeat(1, 3, 1, 1) * 2 - 1
+        t3 = target.to(self.device).float().repeat(1, 3, 1, 1) * 2 - 1
+        return self.model(p3, t3).mean().cpu()
