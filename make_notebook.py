@@ -78,11 +78,23 @@ assert all(checks.values()), "embedded code is not the fixed version"
 CELL2 = '''# --- Cell 2: environment + data ------------------------------------------
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"   # single GPU on purpose
+# Reduces allocator fragmentation, as the CUDA OOM message itself recommends.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 print("torch", torch.__version__, "| cuda", torch.cuda.is_available())
 assert torch.cuda.is_available(), "No GPU. Settings -> Accelerator -> GPU."
 print(torch.cuda.get_device_properties(0).name)
+
+# A previous run OOM'd because another session of the same user still held
+# 11 GB of the card. Check occupancy up front rather than discovering it
+# part way into training.
+free_b, total_b = torch.cuda.mem_get_info()
+print("GPU memory: %.2f GB free of %.2f GB" % (free_b / 1e9, total_b / 1e9))
+assert free_b > 0.35 * total_b, (
+    "Only %.2f GB free -- another process is holding this GPU. Stop your other "
+    "running Kaggle sessions, then restart this session (power icon) and rerun."
+    % (free_b / 1e9))
 
 from pathlib import Path
 def find_dataset(name):

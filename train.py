@@ -202,8 +202,11 @@ def main() -> None:
         drop_last=not args.overfit,
         **loader_kw,
     )
+    # Validation runs on full 256x256 images, so its activations are 4x the
+    # area of a training crop. Batch 8 rather than 16 keeps the peak well below
+    # the training peak, which matters when the GPU is shared.
     val_loader = DataLoader(
-        val_ds, batch_size=16, shuffle=False, num_workers=0, pin_memory=device.type == "cuda"
+        val_ds, batch_size=8, shuffle=False, num_workers=0, pin_memory=device.type == "cuda"
     )
 
     # ---- model / optim ----------------------------------------------------
@@ -212,6 +215,20 @@ def main() -> None:
         model = model.to(memory_format=torch.channels_last)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] device={device} params={n_params/1e6:.2f}M amp={amp}")
+
+    if device.type == "cuda":
+        free_b, total_b = torch.cuda.mem_get_info()
+        free_gb, total_gb = free_b / 1e9, total_b / 1e9
+        print(f"[train] GPU memory: {free_gb:.2f} GB free of {total_gb:.2f} GB")
+        if free_gb < 0.35 * total_gb:
+            # Fail immediately with the actual cause rather than OOM-ing part
+            # way through: on a shared runtime this is almost always another
+            # session of your own still holding the card.
+            raise SystemExit(
+                f"[fatal] only {free_gb:.2f} GB of {total_gb:.2f} GB free -- another "
+                f"process is holding this GPU. Stop your other running sessions and "
+                f"restart this one, or lower --batch_size."
+            )
 
     opt = torch.optim.AdamW(
         model.parameters(),
@@ -258,6 +275,8 @@ def main() -> None:
     loss_ema = None
     nonfinite_streak = 0
     total_nonfinite = 0
+    oom_count = 0
+    OOM_ABORT = 25              # persistent OOM => the batch simply does not fit
     NONFINITE_ABORT = 20        # consecutive non-finite updates => diverged
     NONFINITE_TOTAL_ABORT = 200 # absolute cap: catches an alternating good/bad
                                 # cycle that never builds a long streak
@@ -300,9 +319,27 @@ def main() -> None:
                     print(f"[train] step {step}: LPIPS term enabled")
 
             opt.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", enabled=amp):
-                pred = model(lr_img)
-                loss, parts = criterion(pred, gt)
+            try:
+                with torch.autocast("cuda", enabled=amp):
+                    pred = model(lr_img)
+                    loss, parts = criterion(pred, gt)
+            except torch.cuda.OutOfMemoryError:
+                # Drop the batch and free the allocator rather than losing the
+                # whole run. Persistent OOM is caught by the counter below.
+                oom_count += 1
+                opt.zero_grad(set_to_none=True)
+                del lr_img, gt
+                torch.cuda.empty_cache()
+                print(f"[warn ] step {step}: CUDA OOM, batch skipped "
+                      f"({oom_count} total)", flush=True)
+                if oom_count >= OOM_ABORT:
+                    print(f"[fatal] {OOM_ABORT} OOM events -- the GPU does not have "
+                          f"room for batch_size={cfg['train']['batch_size']}. "
+                          f"Stop other sessions, or rerun with a smaller --batch_size.",
+                          flush=True)
+                    log_f.close()
+                    raise SystemExit(3)
+                continue
 
             lv = float(loss.detach())
             if not math.isfinite(lv):
@@ -398,6 +435,10 @@ def main() -> None:
 
             if step % val_every == 0 or step == total_steps:
                 m = validate(model, val_loader, device, amp)
+                if device.type == "cuda":
+                    # Validation's full-resolution activations fragment the
+                    # allocator; release them before training resumes.
+                    torch.cuda.empty_cache()
                 print(
                     f"[val ] step {step} PSNR {m['psnr']:.3f} SSIM {m['ssim']:.4f}",
                     flush=True,
