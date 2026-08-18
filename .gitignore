@@ -19,6 +19,8 @@ __pycache__/
 venv/
 .DS_Store
 
-# Trained weights are added at submission time, not committed from a test run.
-models/*.pt
+# Intermediate checkpoints stay out; models/best.pt is a required submission
+# deliverable and is committed explicitly.
+models/last.pt
 models/*.pth
+!models/best.pt
